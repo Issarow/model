@@ -1,0 +1,700 @@
+---
+title: "QC, downstream and gene ontology analysis pipeline for mass spectrometry data"
+author: "Chacha Issarow"
+date: "2025-07-10"
+  output: html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#This pipeline for QC, downstream analysis and gene ontology for mass spectrometry data (DIA and DDA), was written in R markdown. 
+#You can also copy from packages (here) downwards to a normal R script and run it if R markdown is not installed in your machine. 
+#If not uing R markdown, please remember to remove R markdown conditions (e,g, ```{r} and ```) before running.
+## R Markdown
+# Load packages
+```{r}
+library(protti)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(ggplot2)
+library(tidyr)
+library(readr)
+library(pheatmap)
+library(tibble)
+library(limma)
+library(org.Hs.eg.db)  # Use appropriate organism package (e.g., org.Mm.eg.db for mouse)
+library(clusterProfiler)
+library(enrichplot)
+library(DOSE)
+library(pathview)
+#library(tidyverse)
+```
+
+#Indlude the path and import the data here:
+```{r, warning=FALSE}
+setwd("E:/TB-HART_allData/DIA-NN_secondResults") # Replace with your actual file paths
+data <- read_delim("report.pg_matrix.tsv", show_col_types = FALSE) # DIA or DDA data 
+annotation <- read_csv("annotationEdit.csv", show_col_types = FALSE) # Contains sample meta info (e.g. sample, condition, batch)
+dim(data)
+#dim(annotation)
+```
+
+#Convert wide file (like report.gg_matrix.csv) to long format
+```{r}
+data <- data %>% pivot_longer(cols = starts_with("2"),
+                              names_to = "sample",
+                              values_to = "intensity"
+                                )
+dim(data)
+```
+
+#Merge data with annotation file
+```{r}
+data_annotated <- data %>% left_join(y = annotation, by = "sample")
+dim(data_annotated)
+```
+
+#Transform intensities to Log2 
+```{r}
+data_annotated <- data_annotated %>%
+  mutate(intensity_log2 = log2(intensity))
+names(data_annotated)
+```
+
+#Filter only samples prior normalisation, remove pools, PPD and NA 
+#use  this option if you want to remove some samples based on conditions, if not just skip it.
+```{r}
+filtered_sample <- subset(data_annotated, Condition != "Pool")
+filtered_sample <- subset(filtered_sample, Condition != "PPD")
+filtered_sample <- subset(filtered_sample, Condition != "Baseline_NA")
+filtered_sample <- subset(filtered_sample, Condition != "Rechallenge_NA")
+dim(filtered_sample)
+names(filtered_sample)
+```
+
+#Optional: peptide/protein filtering: remove low quality data.
+#filter out proteins with low identification counts or missing intensities.
+```{r}
+filtered_sample <- filtered_sample %>%
+  group_by(Condition, Protein.Group) %>%
+  summarise(
+    n = n(),
+    n_missing = sum(is.na(intensity_log2)),
+    missingness = n_missing / n,
+    .groups = "drop"
+  ) %>%
+  filter(missingness <= 0.7) %>%
+  dplyr::select(Protein.Group) %>%
+  distinct() %>%
+  inner_join(filtered_sample, by = "Protein.Group")
+dim(filtered_sample )
+```
+
+
+#Data normalization (e.g., median). Only apply normalzsation if data were not normalised in upstream step (using Dia-NN, Spectronaught, etc). 
+#Otherwise, skip this step if data has been normlised in upstream step
+```{r}
+data_normalised <- filtered_sample %>%
+  normalise(
+    sample = sample,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  )
+#names(data_normalised)
+```
+
+
+#QC assessment
+#checking CV
+```{r, warning=FALSE}
+qc_cvs(
+  data = data_annotated,
+  grouping = Protein.Group,  #Protein.Ids , #rotein_id
+  condition = Condition,
+  intensity = intensity,
+  plot = TRUE,
+  plot_style = "violin"
+)
+```
+
+#CV in table table format
+```{r}
+cv <- qc_cvs(
+  data = data_annotated,
+  grouping = Protein.Group,  #protein_ids, #peptide,
+  condition = Condition,
+  intensity = intensity,
+  plot = FALSE
+)
+cv
+```
+
+#Protein identifications per sample
+```{r, fig.width=16, fig.height=10}
+#(groups use protein, but precursor_id use peptides)
+qc_ids(data = data_annotated,
+       sample = sample,
+       grouping = Protein.Group, 
+       intensity = intensity_log2,
+       condition = Condition,
+       title = "Protein identifications per sample",
+       plot = TRUE
+       )
+```
+
+Protein identifications per sample in table format
+```{r}
+qc_ids(
+  data = data_annotated,
+  sample = sample,
+  grouping = Protein.Group, 
+  intensity = intensity_log2,
+  condition = Condition,
+  plot = FALSE
+)
+```
+
+#Sample intensities:
+#Intensity boxplot is helpful for quick assessment of any major sample losses or measurement issues.
+```{r, warning=FALSE, fig.width=16, fig.height=10}
+#Intensity boxplot prior normalisation
+ggplot(filtered_sample, aes(x = sample, y = intensity_log2, fill = Condition)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Log2 Intensity per Sample", y = "Log2 Intensity") +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1)) +theme(text=element_text(size=16))
+```
+
+
+```{r, warning=FALSE, fig.width=16, fig.height=10}
+#Boxplot post normalisation
+ggplot(data_normalised, aes(x = sample, y = normalised_intensity_log2, fill = Condition, group_by = Condition)) +
+  geom_boxplot() + theme_bw() + theme(text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1)) +
+  labs(x = "", y = "Intensity", title = "Sample intensities")  #+ theme(legend.position = "none")
+
+```
+
+#Intensities can also be assessed by plotting the median as a line plot.This helps you quickly assess if there are any trends in your data
+```{r, fig.width=16, fig.height=10}
+qc_median_intensities(
+  data = filtered_sample,
+  sample = sample,
+  grouping = Protein.Group, #protein_ids, #peptide,
+  intensity = intensity_log2
+)
+```
+
+#Data completeness:
+#Data completeness checks how many of all detected precursors, peptides or proteins were identified in each sample. 
+#The function can return either a plot or a table.
+```{r, fig.width=16, fig.height=10}
+qc_data_completeness(
+  data = data_annotated,
+  sample = sample,
+  grouping = Protein.Group,
+  intensity = intensity_log2,
+  plot = TRUE
+)
+```
+
+#Or display data completeness in table format
+```{r}
+comp <- qc_data_completeness(
+  data = data_annotated,
+  sample = sample,
+  grouping = Protein.Group,
+  intensity = intensity_log2,
+  plot = FALSE
+)
+comp
+```
+
+
+#Log2 Intensity distribution pre- or prio-normalisation
+#For different kinds of analyses (e.g. t-tests) it is important that your data intensity follows a normal distribution
+```{r}
+qc_intensity_distribution(
+  data = data_annotated,
+  grouping = Protein.Group, #protein_group,
+  intensity_log2 = intensity_log2,
+  plot_style = "histogram"
+)
+```
+
+#Sample correlation using pheatmap
+```{r}
+wide_data <- filtered_sample %>%
+  dplyr::select(Protein.Group, sample, intensity_log2) %>%
+  pivot_wider(names_from = sample, values_from = intensity_log2)
+#head(wide_data)
+```
+
+```{r}
+# Remove the protein_id column for correlation
+cor_matrix <- cor(wide_data[,-1], use = "pairwise.complete.obs", method = "pearson") #spearman, pearson 
+#head(cor_matrix)
+```
+
+
+```{r, fig.width=16, fig.height=10}
+pheat <- pheatmap(cor_matrix,
+         main = "Sample Correlation Heatmap",
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize = 10,
+         fontsize_row = 10,
+         fontsize_col = 10,
+         color = colorRampPalette(c("blue", "white", "red"))(100))
+pheat
+#ggsave("E:/TB-HART_allData/DIA-NN_secondResults/corr_heatmap.pdf", plot = pheat, width = 8, height = 6, dpi = 300)
+```
+
+
+#Principal component analysis (PCA)
+#Before plotting your PCA you can check how much of your variance can be explained with each of the principle components
+```{r, fig.width=16, fig.height=10}
+qc_pca(
+  data = filtered_sample, #use "data_normalised" and "normalised_intensity_log2" if applied normalisation in this pipeline
+  sample = sample,
+  grouping = Protein.Group,
+  intensity = intensity_log2,
+  condition = Condition,
+  digestion = NULL,
+  plot_style = "scree"
+)
+```
+
+#Principal component analysis (PCA)
+#This helps us to quickly assess how similar or different our replicates and conditions are
+```{r}
+#Identify variance and use ggplot
+pc <- qc_pca(
+  data = filtered_sample,  #use "data_normalised" and "normalised_intensity_log2" if applied normalisation in this pipeline
+  sample = sample,
+  grouping = Protein.Group, #precursor_id, #protein_group,
+  intensity = intensity_log2,
+  condition = Condition,
+  components = c("PC1", "PC2"),
+  plot_style = "pca",
+  digestion = NULL
+)
+#head(pc)
+```
+
+```{r}
+ggplot(pc$data, aes(x = PC1, y = PC2, colour = Condition)) +
+  geom_point(size = 4) + #stat_ellipse(type = "norm", linetype = 2) +
+  #stat_ellipse(type = "t") +
+  theme_bw() + theme(text = element_text(size = 20)) + #stat_ellipse() +
+  #theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "PC1",y = "PC2", title = "Principal component analysis")  #+ stat_ellipse(geom="polygon", level=0.95, alpha=0.2)
+#+ theme(legend.position = "none")
+#ggsave("E:/TB-HART_allData/DIA-NN_secondResults/pca.pdf", width = 8, height = 6, dpi = 300)
+```
+
+
+##Ranked intensity distribution
+# Plot ranked peptide intensities
+##It can be useful to check which precursors, peptides or proteins are the most or least abundant in the sample by ranking their intensities
+```{r, warning=FALSE}
+qc_ranked_intensities(
+  data = filtered_sample,
+  sample = sample,
+  grouping = Protein.Group,
+  intensity_log2 = intensity_log2,
+  plot = TRUE
+)
+
+```
+
+
+##Downstream analysis
+#Plotting a heatmap using pheatmap
+```{r}
+#reshape data to wide format
+heatmap_matrix <- filtered_sample %>%
+  drop_na(intensity_log2) %>%
+  dplyr::select(Protein.Group, sample, intensity_log2) %>%
+  pivot_wider(names_from = sample, values_from = intensity_log2) %>%
+  column_to_rownames("Protein.Group") %>%
+  as.matrix()
+#head(heatmap_matrix)
+```
+
+#Use this step if you want to filter top proteins, such as 100 or 50 top variableproteins
+```{r}
+# Use this for top 50 or 100 most variable proteins
+top_var <- apply(heatmap_matrix, 1, var) %>% sort(decreasing = TRUE)
+heatmap_matrix <- heatmap_matrix[names(top_var)[1:20], ]
+#head(heatmap_matrix)
+```
+
+
+```{r}
+# Remove rows with NA/NaN/Inf
+heatmap_matrix <- heatmap_matrix[complete.cases(heatmap_matrix), ]
+#head(heatmap_matrix)
+```
+
+
+```{r}
+# Prepare annotation for columns
+sample_annotation <- annotation %>%
+  column_to_rownames("sample")
+#head(sample_annotation)
+```
+
+```{r}
+all(colnames(heatmap_matrix) %in% rownames(sample_annotation))  # should be TRUE
+```
+
+```{r, fig.width=12, fig.height=8}
+#Plot Heatmap with pheatmap
+pheat <- pheatmap(
+  heatmap_matrix,
+  annotation_col = sample_annotation,
+  scale = "row", # optional: scales each row (z-score)
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  show_rownames = FALSE,
+  show_colnames = FALSE
+  #fontsize = 10, #col and row fontsize
+  #fontsize.legend = 7  #Legend fontsize
+)
+#ggsave("E:/TB-HART_allData/DIA-NN_secondResults/pheatmap_heatmap.pdf", plot = pheat, width = 12, height = 8) #Cange this to your own pth
+pheat
+```
+
+ 
+##Differential expression using limma
+```{r}
+annotation <- annotation %>% filter(Condition != "Pool") %>% 
+  filter(Condition != "PPD") %>% filter(Condition != "Baseline_NA") %>% filter(Condition != "Rechallenge_NA")
+dim(annotation)
+```
+ 
+ 
+```{r}
+# Prepare for limma
+design <- model.matrix(~ 0 + annotation$Condition)
+colnames(design) <- levels(as.factor(annotation$Condition))
+rownames(design) <- annotation$sample
+dim(design)
+```
+
+```{r}
+# Create ExpressionSet-like object
+intensity_matrix <- filtered_sample  %>% #use normlised data if applicable 
+  dplyr::select(Protein.Group, sample, intensity_log2) %>% 
+  tidyr::pivot_wider(names_from = sample, values_from = intensity_log2) %>%
+  column_to_rownames("Protein.Group") %>% as.matrix()
+dim(intensity_matrix)
+```
+
+
+```{r}
+#Match order
+intensity_matrix <- intensity_matrix[, rownames(design)]  # match column order
+dim(intensity_matrix)
+```
+
+```{r}
+all(colnames(intensity_matrix) == rownames(design))  # Should be TRUE
+```
+
+
+```{r, warning=FALSE}
+fit <- lmFit(intensity_matrix, design)
+#head(fit)
+```
+
+
+```{r}
+# Define contrasts
+contrast_matrix <- makeContrasts(
+  Baseline_RTB_vs_Rechallenge_RTB = Baseline_RTB - Rechallenge_RTB,
+  levels = design
+)
+#head(contrast_matrix)
+```
+
+
+```{r}
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+#head(fit2)
+```
+
+```{r}
+# Get DE results
+results <- topTable(fit2, coef = "Baseline_RTB_vs_Rechallenge_RTB", adjust = "BH", number = Inf)
+#head(results)
+```
+
+#Add proein names and export
+```{r}
+results$Protein.Group <- rownames(results)
+results <- results %>%
+  relocate(Protein.Group)
+#head(results)
+
+#write.csv(results, "limma_DE_results.csv", row.names = FALSE)
+```
+
+#Volcano plots
+```{r}
+results$Diff_expression <- "Not significant"
+results$Diff_expression[results$logFC > 1 & results$P.Value < 0.05] <- "Up regulated"
+results$Diff_expression[results$logFC < -1 & results$P.Value < 0.05] <- "Down regulated"
+mycolors <- c("grey", "red", "blue")
+names(mycolors) <- c("Not significant", "Up regulated", "Down regulated")
+
+#head(results)
+```
+
+```{r, warning=FALSE}
+ggplot(results, aes(x = logFC, y=-log10(P.Value), color = Diff_expression)) +
+  geom_point(size =4) + theme_bw() + xlim(-4, 4) +
+  #scale_colour_discrete(type=ghibli_subset, breaks = c("Up", "Down")) +
+  geom_hline(yintercept = -1*log10(0.05), linetype = 2, alpha = 0.5) +
+  geom_vline(xintercept = 1, linetype = 2, alpha = 0.5) +
+  geom_vline(xintercept = -1, linetype = 2, alpha = 0.5) + #xlim(-2, 2) +
+  scale_colour_manual(values = mycolors) + theme(text = element_text(size = 18)) +
+  labs(x = "log2(fold change)", y = "-log10(p-value)", title =  "Baseline_RTB_vs_Rechallenge_RTB")
+```
+
+Gene ontology enrichment using ClusreProfiler. Use DE results from limma as input for ClusterProfiler.
+```{r}
+gene_ids <- results$Protein.Group
+#head(gene_ids)
+```
+
+```{r}
+# Convert to Entrez IDs (if needed)
+gene_df <- bitr(gene_ids, fromType = "UNIPROT", 
+                toType = "ENTREZID", 
+                OrgDb = org.Hs.eg.db)
+#head(gene_df)
+```
+
+```{r}
+gene_ids <- gene_df$ENTREZID
+#head(gene_ids)
+```
+
+```{r}
+##GO Enrichment Analysis
+ego <- enrichGO(gene = gene_ids,
+                OrgDb = org.Hs.eg.db,
+                ont = "BP",  # Use "MF" or "CC" for other ontologies
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05,
+                qvalueCutoff  = 0.2,
+                readable      = TRUE)
+#head(ego)
+```
+
+```{r}
+#Visualisation
+# Barplot
+barplot(ego, showCategory = 10, title = "GO Enrichment")
+```
+
+```{r}
+# Dotplot
+dotplot(ego, showCategory = 10) + 
+  ggtitle("Biological Process enrichment")
+```
+
+```{r, warning=FALSE, fig.width=16, fig.height=10}
+# cnetplot - gene-concept network
+cnetplot(ego, circular = TRUE, colorEdge = TRUE)
+```
+
+#KEGG Pathway Enrichment
+```{r}
+ekegg <- enrichKEGG(gene = gene_ids, 
+                    organism = 'hsa',  # use 'mmu' for mouse
+                    pvalueCutoff = 0.05)
+#head(ekegg)
+```
+
+
+```{r}
+# Optional: convert to readable symbols
+ekegg <- setReadable(ekegg, 
+                     OrgDb = org.Hs.eg.db, 
+                     keyType="ENTREZID")
+#head(ekegg)
+```
+
+```{r}
+##Visulisation
+# KEGG Dotplot
+dotplot(ekegg, showCategory = 10)
+```
+
+
+```{r, warning=FALSE, fig.width=16, fig.height=10}
+# KEGG Pathway Plot (requires pathview), not very clear how to interpret the figure
+pathview(gene.data  = gene_ids,
+         pathway.id = ekegg@result$ID[1], 
+         species    = "hsa")
+```
+
+
+```{r}
+#Save results
+# Save GO results
+write.csv(as.data.frame(ego), "GO_BP_enrichment.csv", row.names = FALSE)
+
+# Save KEGG results
+write.csv(as.data.frame(ekegg), "KEGG_enrichment.csv", row.names = FALSE)
+```
+
+
+#Part2: Use fold change (logFC) to separate down and up regulation
+```{r}
+# we want the log2 fold change 
+original_gene_list <- results$logFC
+#head(original_gene_list)
+```
+
+```{r}
+# name the vector
+names(original_gene_list) <- results$Protein.Group
+#head(original_gene_list)
+```
+
+```{r}
+# omit any NA values 
+gene_list <- na.omit(original_gene_list)
+# sort the list in decreasing order (required for clusterProfiler)
+gene_list = sort(gene_list, decreasing = TRUE)
+#head(gene_list)
+```
+
+
+```{r}
+##Gene Set Enrichment
+organism <- org.Hs.eg.db
+gse <- gseGO(geneList=gene_list, 
+             ont ="MF",       ##ont one of “BP”, “MF”, “CC” or “ALL”
+             keyType = "UNIPROT", 
+             #nPerm = 10000, 
+             minGSSize = 10, # exclude GO terms with <10 genes
+             maxGSSize = 500, # filter out GO terms with >800 genes
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "none")   #BH
+#head(gse)
+```
+
+
+```{r}
+###Dotplot
+dotplot(gse, showCategory=10, split=".sign") + facet_grid(.~.sign) + 
+  ggtitle("Significant Biological Process enrichment")
+```
+
+
+```{r}
+
+# categorySize can be either 'pvalue' or 'geneNum'
+cnetplot(gse, categorySize="pvalue", foldChange=gene_list, showCategory = 3)
+
+```
+
+#KEGG Gene Set Enrichment Analysis
+For KEGG pathway enrichment using the gseKEGG() function, we need to convert id types. We can use the bitr function for this (included in clusterProfiler).
+
+```{r}
+#Prepare Input
+# Convert gene IDs for gseKEGG function
+# We will lose some genes here because not all IDs will be converted
+ids<-bitr(names(original_gene_list), fromType = "UNIPROT", toType = "ENTREZID", OrgDb=organism)
+#head(ids) 
+```
+
+```{r}
+# remove duplicate IDS (here I use "ENSEMBL", but it should be whatever was selected as keyType)
+dedup_ids <- ids[!duplicated(ids[c("UNIPROT")]),]
+#head(dedup_ids)
+```
+
+```{r}
+# Create a new dataframe df2 which has only the genes which were successfully mapped using the bitr function above
+df2 = results[results$Protein.Group %in% dedup_ids$UNIPROT,]
+#head(df2)
+```
+
+```{r}
+# Create a new column in df2 with the corresponding ENTREZ IDs
+df2$ENTREZ_ID = dedup_ids$ENTREZID
+#head(df2)
+```
+
+```{r}
+# Create a vector of the gene unuiverse
+kegg_gene_list <- df2$logFC
+#head(kegg_gene_list)
+```
+
+```{r}
+# Name vector with ENTREZ ids
+names(kegg_gene_list) <- df2$ENTREZ_ID
+# omit any NA values 
+kegg_gene_list <- na.omit(kegg_gene_list)
+# sort the list in decreasing order (required for clusterProfiler)
+kegg_gene_list = sort(kegg_gene_list, decreasing = TRUE)
+#head(kegg_gene_list)
+```
+
+```{r}
+any(duplicated(names(kegg_gene_list)))
+```
+
+```{r}
+#remove duplicates
+kegg_gene_list <- kegg_gene_list[!duplicated(names(kegg_gene_list))]
+```
+
+
+```{r}
+##Create gseKEGG object
+kegg_organism = "hsa"  #
+kk2 <- gseKEGG(geneList     = kegg_gene_list,
+               organism     = kegg_organism,
+               minGSSize    = 3,
+               maxGSSize    = 500,
+               pvalueCutoff = 0.05,
+               pAdjustMethod = "none",
+               keyType       = "kegg")
+#head(kk2)
+```
+
+```{r}
+##Dotplot
+dotplot(kk2, showCategory = 10, title = "KEGG Enriched Pathways" , split=".sign") + facet_grid(.~.sign)
+```
+
+```{r}
+
+##Category Netplot:
+#The cnetplot depicts the linkages of genes and biological concepts (e.g. 
+#GO terms or KEGG pathways) as a network (helpful to see which genes are involved in 
+#enriched pathways and genes that may belong to multiple annotation categories).
+# categorySize can be either 'pvalue' or 'geneNum'
+cnetplot(kk2, categorySize="pvalue", foldChange=gene_list)
+```
+
+
+

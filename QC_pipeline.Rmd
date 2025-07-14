@@ -1,0 +1,373 @@
+---
+title: "QC pipeline for mass spetrometry data"
+author: "Chacha Issarow"
+date: "2025-06-20"
+  output: html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Overview of the pipeline:
+#Quality control (QC) pipeline for both DIA and DDA mass spectrometry data using R packages. 
+#The pipeline includes:
+# Data and annotation importation files
+# Data filtering and normalization
+# QC plots (missing values, intensity distributions, data completeness, PCA, CVs, data correlation, heatmap, etc)
+ 
+#This pipeline provides an overview of how you can prepare the quantitative protein/peptide matrix output from common search engines and software, such as Spectronaut, MaxQuant, Proteome Discoverer, Skyline and Dia-nn.
+
+## R Markdown (This pipeline was written in R markdown. You can run it as R script by removing R markdown conditions (```{r} and ```) from Load packages)
+#Load packages
+```{r}
+library(protti)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(ggplot2)
+library(tidyr)
+library(readr)
+library(pheatmap)
+library(tibble)
+```
+
+#Include the path and import the data and annotation here:
+```{r, warning=FALSE}
+setwd("E:/TB-HART_allData/DIA-NN_secondResults") # Replace with your actual file paths
+
+data <- read_delim("report.pg_matrix.tsv", show_col_types = FALSE) # DIA or DDA data 
+annotation <- read_csv("annotationEdit.csv", show_col_types = FALSE) # Annotation file, contains sample meta info (e.g. sample, condition, batch)
+dim(data)
+head(annotation)
+```
+
+#Convert wide file (like report.pg_matrix.csv from Dia-nn) to long format. If using long file, such as report.tsv from Dia-nn, then skip this stage.
+#Convert wide file (like report.gg_matrix.csv) to long format
+```{r}
+data <- data %>% pivot_longer(cols = starts_with("2"),
+                              names_to = "sample",
+                              values_to = "intensity"
+                                )
+dim(data)
+```
+
+#Merge data with annotation file
+```{r}
+data_annotated <- data %>% left_join(y = annotation, by = "sample")
+dim(data_annotated)
+```
+
+#Transform intensities to Log2 
+```{r}
+data_annotated <- data_annotated %>%
+  mutate(intensity_log2 = log2(intensity))
+names(data_annotated)
+```
+
+
+#Filter only samples prior normalisation, remove pools, PPD and NA 
+#use this option if you want to remove some samples based on condition, otherwise, just skip it.
+```{r}
+filtered_sample <- subset(data_annotated, Condition != "Pool")
+filtered_sample <- subset(filtered_sample, Condition != "PPD")
+filtered_sample <- subset(filtered_sample, Condition != "Baseline_NA")
+filtered_sample <- subset(filtered_sample, Condition != "Rechallenge_NA")
+dim(filtered_sample)
+#names(filtered_sample)
+```
+
+#Optional: peptide/protein filtering: remove low quality data.
+#filter out proteins with low identification counts or missing intensities.
+```{r}
+filtered_sample <- filtered_sample %>%  
+  group_by(Condition, Protein.Group) %>%
+  summarise(
+    n = n(),
+    n_missing = sum(is.na(intensity_log2)),
+    missingness = n_missing / n,
+    .groups = "drop"
+  ) %>%
+  filter(missingness <= 0.7) %>%
+  dplyr::select(Protein.Group) %>%
+  distinct() %>%
+  inner_join(filtered_sample, by = "Protein.Group")
+dim(filtered_sample )
+```
+
+
+#Data normalization (e.g., median). Only apply normalzsation if data were not normalised in upstream step (using Dia-NN, Spectronaught, etc). 
+#Otherwise, skip this step if data has been normlised in upstream step
+```{r}
+data_normalised <- filtered_sample %>%
+  normalise(
+    sample = sample,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  )
+#names(data_normalised)
+```
+
+
+#QC assessment
+#checking CV
+```{r, warning=FALSE}
+qc_cvs(
+  data = data_annotated,
+  grouping = Protein.Group,  #Protein.Ids , #rotein_id
+  condition = Condition,
+  intensity = intensity,
+  plot = TRUE,
+  plot_style = "violin"
+)
+```
+
+#CV in table table format
+```{r}
+cv <- qc_cvs(
+  data = data_annotated,
+  grouping = Protein.Group,  #protein_ids, #peptide,
+  condition = Condition,
+  intensity = intensity,
+  plot = FALSE
+)
+cv
+```
+
+#Protein identifications per sample
+```{r, fig.width=16, fig.height=10}
+#(groups use protein, but precursor_id use peptides)
+qc_ids(data = data_annotated,
+       sample = sample,
+       grouping = Protein.Group, 
+       intensity = intensity_log2,
+       condition = Condition,
+       title = "Protein identifications per sample",
+       plot = TRUE
+       )
+```
+
+Protein identifications per sample in table format
+```{r}
+qc_ids(
+  data = data_annotated,
+  sample = sample,
+  grouping = Protein.Group, 
+  intensity = intensity_log2,
+  condition = Condition,
+  plot = FALSE
+)
+```
+
+#Sample intensities:
+#Intensity boxplot is helpful for quick assessment of any major sample losses or measurement issues.
+```{r, warning=FALSE, fig.width=16, fig.height=10}
+#Intensity boxplot prior normalisation
+ggplot(filtered_sample, aes(x = sample, y = intensity_log2, fill = Condition)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Log2 Intensity per Sample", y = "Log2 Intensity") +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1)) +theme(text=element_text(size=16))
+```
+
+
+```{r, warning=FALSE, fig.width=16, fig.height=10}
+#Boxplot post normalisation
+ggplot(data_normalised, aes(x = sample, y = normalised_intensity_log2, fill = Condition, group_by = Condition)) +
+  geom_boxplot() + theme_bw() + theme(text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1)) +
+  labs(x = "", y = "Intensity", title = "Sample intensities")  #+ theme(legend.position = "none")
+
+```
+
+#Intensities can also be assessed by plotting the median as a line plot.This helps you quickly assess if there are any trends in your data
+```{r, fig.width=16, fig.height=10}
+qc_median_intensities(
+  data = filtered_sample,
+  sample = sample,
+  grouping = Protein.Group, #protein_ids, #peptide,
+  intensity = intensity_log2
+)
+```
+
+#Data completeness:
+#Data completeness checks how many of all detected precursors, peptides or proteins were identified in each sample. 
+#The function can return either a plot or a table.
+```{r, fig.width=16, fig.height=10}
+qc_data_completeness(
+  data = data_annotated,
+  sample = sample,
+  grouping = Protein.Group,
+  intensity = intensity_log2,
+  plot = TRUE
+)
+```
+
+#Or display data completeness in table format
+```{r}
+comp <- qc_data_completeness(
+  data = data_annotated,
+  sample = sample,
+  grouping = Protein.Group,
+  intensity = intensity_log2,
+  plot = FALSE
+)
+comp
+```
+
+
+#Log2 Intensity distribution pre- or prio-normalisation
+#For different kinds of analyses (e.g. t-tests) it is important that your data intensity follows a normal distribution
+```{r}
+qc_intensity_distribution(
+  data = data_annotated,
+  grouping = Protein.Group, #protein_group,
+  intensity_log2 = intensity_log2,
+  plot_style = "histogram"
+)
+```
+
+#Sample correlation using pheatmap
+```{r}
+wide_data <- filtered_sample %>%
+  dplyr::select(Protein.Group, sample, intensity_log2) %>%
+  pivot_wider(names_from = sample, values_from = intensity_log2)
+#head(wide_data)
+```
+
+```{r}
+# Remove the protein_id column for correlation
+cor_matrix <- cor(wide_data[,-1], use = "pairwise.complete.obs", method = "pearson") #spearman, pearson 
+#head(cor_matrix)
+```
+
+
+```{r, fig.width=16, fig.height=10}
+pheat <- pheatmap(cor_matrix,
+         main = "Sample Correlation Heatmap",
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize = 10,
+         fontsize_row = 10,
+         fontsize_col = 10,
+         color = colorRampPalette(c("blue", "white", "red"))(100))
+pheat
+#ggsave("E:/TB-HART_allData/DIA-NN_secondResults/corr_heatmap.pdf", plot = pheat, width = 8, height = 6, dpi = 300)
+```
+
+
+#Principal component analysis (PCA)
+#Before plotting your PCA you can check how much of your variance can be explained with each of the principle components
+```{r, fig.width=16, fig.height=10}
+qc_pca(
+  data = filtered_sample, #use "data_normalised" and "normalised_intensity_log2" if applied normalisation in this pipeline
+  sample = sample,
+  grouping = Protein.Group,
+  intensity = intensity_log2,
+  condition = Condition,
+  digestion = NULL,
+  plot_style = "scree"
+)
+```
+
+#Principal component analysis (PCA)
+#This helps us to quickly assess how similar or different our replicates and conditions are
+```{r}
+#Identify variance and use ggplot
+pc <- qc_pca(
+  data = filtered_sample,  #use "data_normalised" and "normalised_intensity_log2" if applied normalisation in this pipeline
+  sample = sample,
+  grouping = Protein.Group, #precursor_id, #protein_group,
+  intensity = intensity_log2,
+  condition = Condition,
+  components = c("PC1", "PC2"),
+  plot_style = "pca",
+  digestion = NULL
+)
+#head(pc)
+```
+
+```{r}
+ggplot(pc$data, aes(x = PC1, y = PC2, colour = Condition)) +
+  geom_point(size = 4) + #stat_ellipse(type = "norm", linetype = 2) +
+  #stat_ellipse(type = "t") +
+  theme_bw() + theme(text = element_text(size = 20)) + #stat_ellipse() +
+  #theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "PC1",y = "PC2", title = "Principal component analysis")  #+ stat_ellipse(geom="polygon", level=0.95, alpha=0.2)
+#+ theme(legend.position = "none")
+#ggsave("E:/TB-HART_allData/DIA-NN_secondResults/pca.pdf", width = 8, height = 6, dpi = 300)
+```
+
+
+##Ranked intensity distribution
+# Plot ranked peptide intensities
+##It can be useful to check which precursors, peptides or proteins are the most or least abundant in the sample by ranking their intensities
+```{r, warning=FALSE}
+qc_ranked_intensities(
+  data = filtered_sample,
+  sample = sample,
+  grouping = Protein.Group,
+  intensity_log2 = intensity_log2,
+  plot = TRUE
+)
+
+````
+
+
+Plotting a heatmap using pheatmap
+```{r}
+#reshape data to wide format
+heatmap_matrix <- data_normalised %>%
+  drop_na(intensity_log2) %>%
+  dplyr::select(Protein.Group, sample, intensity_log2) %>%
+  pivot_wider(names_from = sample, values_from = intensity_log2) %>%
+  column_to_rownames("Protein.Group") %>%
+  as.matrix()
+#head(heatmap_matrix)
+```
+
+```{r}
+# Top 50 or 100 most variable proteins
+#top_var <- apply(heatmap_matrix, 1, var) %>% sort(decreasing = TRUE)
+#heatmap_matrix <- heatmap_matrix[names(top_var)[1:20], ]
+#head(heatmap_matrix)
+```
+
+
+```{r}
+# Remove rows with NA/NaN/Inf
+heatmap_matrix <- heatmap_matrix[complete.cases(heatmap_matrix), ]
+#head(heatmap_matrix)
+```
+
+
+```{r}
+# Prepare annotation for columns
+sample_annotation <- annotation %>%
+  column_to_rownames("sample")
+#head(sample_annotation)
+```
+
+```{r}
+all(colnames(heatmap_matrix) %in% rownames(sample_annotation))  # should be TRUE
+#all(rownames(sample_annotation) %in% colnames(heatmap_matrix))  # should also be TRUE
+```
+
+```{r}
+#Plot Heatmap with pheatmap
+pheat <- pheatmap(
+  heatmap_matrix,
+  annotation_col = sample_annotation,
+  scale = "row", # optional: scales each row (z-score)
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  show_rownames = FALSE,
+  show_colnames = FALSE
+)
+ggsave("E:/TB-HART_allData/DIA-NN_secondResults/pheatmap_heatmap2.pdf", plot = pheat, width = 8, height = 6, dpi = 300) #Replace with your actual path
+pheat
+```
+
+
